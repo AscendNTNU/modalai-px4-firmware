@@ -140,6 +140,7 @@ private:
 
 	float _accel_interval_us{NAN};
 	float _gyro_interval_us{NAN};
+	float _accel_sliding_dt{0.0};
 
 	unsigned _accel_last_generation{0};
 	unsigned _gyro_last_generation{0};

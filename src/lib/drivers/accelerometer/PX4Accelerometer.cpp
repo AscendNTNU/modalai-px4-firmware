@@ -31,11 +31,11 @@
  *
  ****************************************************************************/
 
-
 #include "PX4Accelerometer.hpp"
 
 #include <lib/drivers/device/Device.hpp>
 #include <lib/parameters/param.h>
+#include <ctime>
 
 using namespace time_literals;
 
@@ -43,7 +43,8 @@ static constexpr int32_t sum(const int16_t samples[], uint8_t len)
 {
 	int32_t sum = 0;
 
-	for (int n = 0; n < len; n++) {
+	for (int n = 0; n < len; n++)
+	{
 		sum += samples[n];
 	}
 
@@ -54,11 +55,13 @@ static constexpr uint8_t clipping(const int16_t samples[], uint8_t len)
 {
 	unsigned clip_count = 0;
 
-	for (int n = 0; n < len; n++) {
+	for (int n = 0; n < len; n++)
+	{
 		// - consider data clipped/saturated if it's INT16_MIN/INT16_MAX or within 1
 		// - this accommodates rotated data (|INT16_MIN| = INT16_MAX + 1)
 		//   and sensors that may re-use the lowest bit for other purposes (sync indicator, etc)
-		if ((samples[n] <= INT16_MIN + 1) || (samples[n] >= INT16_MAX - 1)) {
+		if ((samples[n] <= INT16_MIN + 1) || (samples[n] >= INT16_MAX - 1))
+		{
 			clip_count++;
 		}
 	}
@@ -66,9 +69,8 @@ static constexpr uint8_t clipping(const int16_t samples[], uint8_t len)
 	return clip_count;
 }
 
-PX4Accelerometer::PX4Accelerometer(uint32_t device_id, enum Rotation rotation) :
-	_device_id{device_id},
-	_rotation{rotation}
+PX4Accelerometer::PX4Accelerometer(uint32_t device_id, enum Rotation rotation) : _device_id{device_id},
+																				 _rotation{rotation}
 {
 	// advertise immediately to keep instance numbering in sync
 	_sensor_pub.advertise();
@@ -97,14 +99,9 @@ void PX4Accelerometer::set_device_type(uint8_t devtype)
 
 void PX4Accelerometer::set_scale(float scale)
 {
-	if (fabsf(scale - _scale) > FLT_EPSILON) {
+	if (fabsf(scale - _scale) > FLT_EPSILON)
+	{
 		// rescale last sample on scale change
-		float rescale = _scale / scale;
-
-		for (auto &s : _last_sample) {
-			s = roundf(s * rescale);
-		}
-
 		_scale = scale;
 
 		UpdateClipLimit();
@@ -140,7 +137,8 @@ void PX4Accelerometer::updateFIFO(sensor_accel_fifo_s &sample)
 	// rotate all raw samples and publish fifo
 	const uint8_t N = sample.samples;
 
-	for (int n = 0; n < N; n++) {
+	for (int n = 0; n < N; n++)
+	{
 		rotate_3i(_rotation, sample.x[n], sample.y[n], sample.z[n]);
 	}
 
@@ -149,7 +147,6 @@ void PX4Accelerometer::updateFIFO(sensor_accel_fifo_s &sample)
 	sample.timestamp = hrt_absolute_time();
 	_sensor_fifo_pub.publish(sample);
 
-
 	// publish
 	sensor_accel_s report;
 	report.timestamp_sample = sample.timestamp_sample;
@@ -157,15 +154,11 @@ void PX4Accelerometer::updateFIFO(sensor_accel_fifo_s &sample)
 	report.temperature = _temperature;
 	report.error_count = _error_count;
 
-	// trapezoidal integration (equally spaced)
-	const float scale = _scale / (float)N;
-	report.x = (0.5f * (_last_sample[0] + sample.x[N - 1]) + sum(sample.x, N - 1)) * scale;
-	report.y = (0.5f * (_last_sample[1] + sample.y[N - 1]) + sum(sample.y, N - 1)) * scale;
-	report.z = (0.5f * (_last_sample[2] + sample.z[N - 1]) + sum(sample.z, N - 1)) * scale;
-
-	_last_sample[0] = sample.x[N - 1];
-	_last_sample[1] = sample.y[N - 1];
-	_last_sample[2] = sample.z[N - 1];
+	// average the FIFO queue
+	const float scale = _scale / (float)(N);
+	report.x = sum(sample.x, N) * scale;
+	report.y = sum(sample.y, N) * scale;
+	report.z = sum(sample.z, N) * scale;
 
 	report.clip_counter[0] = clipping(sample.x, N);
 	report.clip_counter[1] = clipping(sample.y, N);

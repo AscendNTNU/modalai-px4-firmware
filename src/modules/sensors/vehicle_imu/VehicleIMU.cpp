@@ -352,11 +352,17 @@ bool VehicleIMU::UpdateAccel()
 
 
 		const float dt = (accel.timestamp_sample - _accel_timestamp_sample_last) * 1e-6f;
+		_accel_sliding_dt = _accel_sliding_dt + (dt - _accel_sliding_dt)* 0.01f;
+		if (_accel_sliding_dt >0.1f){
+			_accel_sliding_dt = 0.1f;
+		}
+
 		_accel_timestamp_sample_last = accel.timestamp_sample;
+		// PX4_INFO("accel dt: %f", double(_accel_sliding_dt));
 
 		const Vector3f accel_raw{accel.x, accel.y, accel.z};
 		_raw_accel_mean.update(accel_raw);
-		_accel_integrator.put(accel_raw, dt);
+		_accel_integrator.put(accel_raw, _accel_sliding_dt);
 
 		updated = true;
 
@@ -460,7 +466,6 @@ bool VehicleIMU::UpdateGyro()
 		_gyro_last_generation = _sensor_gyro_sub.get_last_generation();
 
 		const float dt = (gyro.timestamp_sample - _gyro_timestamp_sample_last) * 1e-6f;
-
 		_gyro_timestamp_sample_last = gyro.timestamp_sample;
 		_gyro_timestamp_last = gyro.timestamp;
 
