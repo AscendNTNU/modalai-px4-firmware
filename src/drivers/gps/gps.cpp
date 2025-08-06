@@ -123,6 +123,7 @@ public:
 	enum class Instance : uint8_t {
 		Main = 0,
 		Secondary,
+		RTCM,
 
 		Count
 	};
@@ -150,11 +151,15 @@ public:
 
 	/**
 	 * task spawn trampoline for the secondary GPS
+	 * and seperate interface for RTCM
 	 */
 	static int run_trampoline_secondary(int argc, char *argv[]);
+	static int run_trampoline_rtcm(int argc, char *argv[]);
+	
 
 	/** @see ModuleBase::run() */
 	void run() override;
+	void run_forwarding();
 
 	/**
 	 * Diagnostics - print some basic information about the driver.
@@ -172,29 +177,28 @@ public:
 	void reset_if_scheduled();
 
 private:
-	int				_serial_fd{-1};					///< serial interface to GPS
-	unsigned			_baudrate{0};					///< current baudrate
-	const unsigned			_configured_baudrate{0};			///< configured baudrate (0=auto-detect)
-	char				_port[20] {};					///< device / serial port path
+	int				    	_serial_fd{-1};					///< serial interface to GPS
+	unsigned				_baudrate{0};					///< current baudrate
+	const unsigned	    	_configured_baudrate{0};		///< configured baudrate (0=auto-detect)
+	char					_port[20] {};					///< device / serial port path
 
-	bool				_healthy{false};				///< flag to signal if the GPS is ok
-	bool				_mode_auto;					///< if true, auto-detect which GPS is attached
+	bool					_healthy{false};				///< flag to signal if the GPS is ok
+	bool					_mode_auto;						///< if true, auto-detect which GPS is attached
 
-	gps_driver_mode_t		_mode;						///< current mode
+	gps_driver_mode_t		_mode;							///< current mode
 
-	GPSHelper::Interface		_interface;   					///< interface
-	GPSHelper			*_helper{nullptr};				///< instance of GPS parser
+	GPSHelper::Interface	_interface;   					///< interface
+	GPSHelper				*_helper{nullptr};				///< instance of GPS parser
 
-	GPS_Sat_Info			*_sat_info{nullptr};				///< instance of GPS sat info data object
+	GPS_Sat_Info			*_sat_info{nullptr};			///< instance of GPS sat info data object
 
 	sensor_gps_s			_report_gps_pos{};				///< uORB topic for gps position
-	satellite_info_s		*_p_report_sat_info{nullptr};			///< pointer to uORB topic for satellite info
-	uint8_t                         _spoofing_state{0};                             ///< spoofing state
-	uint8_t                         _jamming_state{0};                              ///< jamming state
+	satellite_info_s		*_p_report_sat_info{nullptr};	///< pointer to uORB topic for satellite info
+	uint8_t                 _spoofing_state{0};             ///< spoofing state
+	uint8_t                 _jamming_state{0};              ///< jamming state
 
 	uORB::PublicationMulti<sensor_gps_s>	_report_gps_pos_pub{ORB_ID(sensor_gps)};	///< uORB pub for gps position
 	uORB::PublicationMulti<sensor_gnss_relative_s> _sensor_gnss_relative_pub{ORB_ID(sensor_gnss_relative)};
-
 	uORB::PublicationMulti<satellite_info_s>	_report_sat_info_pub{ORB_ID(satellite_info)};		///< uORB pub for satellite info
 
 	float				_rate{0.0f};					///< position update rate
@@ -205,7 +209,7 @@ private:
 	hrt_abstime			_last_rtcm_injection_time{0};			///< time of last rtcm injection
 	uint8_t				_selected_rtcm_instance{0};			///< uorb instance that is being used for RTCM corrections
 
-	const Instance 			_instance;
+	const Instance 		_instance;
 
 	uORB::Subscription		     _orb_inject_data_sub{ORB_ID(gps_inject_data)};
 	uORB::Publication<gps_inject_data_s> _gps_inject_data_pub{ORB_ID(gps_inject_data)};
@@ -218,8 +222,11 @@ private:
 	/// and thus we wait until the first one publishes at least one message.
 
 	static px4::atomic<GPS *> _secondary_instance;
+	static px4::atomic<GPS *> _rtcm_instance;
 
 	px4::atomic<int> _scheduled_reset{(int)GPSRestartType::None};
+
+	bool open_serial_fd();
 
 	/**
 	 * Publish the gps struct
@@ -293,12 +300,29 @@ private:
 
 px4::atomic_bool GPS::_is_gps_main_advertised{false};
 px4::atomic<GPS *> GPS::_secondary_instance{nullptr};
+px4::atomic<GPS *> GPS::_rtcm_instance{nullptr};
+
 
 /*
  * Driver 'main' command.
  */
 extern "C" __EXPORT int gps_main(int argc, char *argv[]);
 
+int wait_for_task_spawn(px4::atomic<GPS*> instance, bool load=true, int timeout=1000000) // 1s timeout 
+{
+	int i = 0;
+	int iter = timeout / 2500;
+	do { 
+		/* wait in intervals of 2500 us */
+		px4_usleep(2500);
+		if ((load && instance.load()) ||
+			(!load && !instance.load())) {
+			return 0;
+		}
+	} while (++i < iter);
+	PX4_ERR("Timed out waiting for GPS instance thread");
+	return -1;
+}
 
 GPS::GPS(const char *path, gps_driver_mode_t mode, GPSHelper::Interface interface, Instance instance,
 	 unsigned configured_baudrate) :
@@ -368,17 +392,17 @@ GPS::GPS(const char *path, gps_driver_mode_t mode, GPSHelper::Interface interfac
 GPS::~GPS()
 {
 	GPS *secondary_instance = _secondary_instance.load();
+	GPS *rtcm_instance = _rtcm_instance.load();
 
-	if (_instance == Instance::Main && secondary_instance) {
-		secondary_instance->request_stop();
-
-		// wait for it to exit
-		unsigned int i = 0;
-
-		do {
-			px4_usleep(20000); // 20 ms
-			++i;
-		} while (_secondary_instance.load() && i < 100);
+	if (_instance == Instance::Main) {
+		if (secondary_instance) {
+			secondary_instance->request_stop();
+			wait_for_task_spawn(_secondary_instance, false);
+		}
+		if (rtcm_instance) {
+			rtcm_instance->request_stop();
+			wait_for_task_spawn(_rtcm_instance, false);
+		}
 	}
 
 	delete _sat_info;
@@ -777,6 +801,51 @@ void GPS::dumpGpsData(uint8_t *data, size_t len, gps_dump_comm_mode_t mode, bool
 	}
 }
 
+bool 
+GPS::open_serial_fd()
+{
+	if (_serial_fd < 0) {
+#ifdef __PX4_QURT
+		if (_configured_baudrate) {
+			_serial_fd = qurt_uart_open(_port, _configured_baudrate);
+		} else {
+			// Qurt needs a valid baud rate to successfully open a port
+			_serial_fd = qurt_uart_open(_port, 9600);
+		}
+#else
+		/* open the serial port */
+		_serial_fd = ::open(_port, O_RDWR | O_NOCTTY);
+#endif
+
+		if (_serial_fd < 0) {
+			PX4_ERR("failed to open %s err: %d", _port, errno);
+			return false;
+		}
+
+#ifdef __PX4_LINUX
+
+		if (_interface == GPSHelper::Interface::SPI) {
+			int spi_speed = 1000000; // make sure the bus speed is not too high (required on RPi)
+			int status_value = ::ioctl(_serial_fd, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed);
+
+			if (status_value < 0) {
+				PX4_ERR("SPI_IOC_WR_MAX_SPEED_HZ failed for %s (%d)", _port, errno);
+			}
+
+			status_value = ::ioctl(_serial_fd, SPI_IOC_RD_MAX_SPEED_HZ, &spi_speed);
+
+			if (status_value < 0) {
+				PX4_ERR("SPI_IOC_RD_MAX_SPEED_HZ failed for %s (%d)", _port, errno);
+			}
+
+			// Failure to configure optimal SPI settings is permissable and will not return a failed result (-1)
+		}
+
+#endif /* __PX4_LINUX */
+	}
+	return true;
+}
+
 void
 GPS::run()
 {
@@ -867,44 +936,11 @@ GPS::run()
 			delete (_helper);
 			_helper = nullptr;
 		}
-
-		if (_serial_fd < 0) {
-#ifdef __PX4_QURT
-			if (_configured_baudrate) {
-				_serial_fd = qurt_uart_open(_port, _configured_baudrate);
-			} else {
-				// Qurt needs a valid baud rate to successfully open a port
-				_serial_fd = qurt_uart_open(_port, 9600);
-			}
-#else
-			/* open the serial port */
-			_serial_fd = ::open(_port, O_RDWR | O_NOCTTY);
-#endif
-
-			if (_serial_fd < 0) {
-				PX4_ERR("failed to open %s err: %d", _port, errno);
-				px4_sleep(1);
-				continue;
-			}
-
-#ifdef __PX4_LINUX
-
-			if (_interface == GPSHelper::Interface::SPI) {
-				int spi_speed = 1000000; // make sure the bus speed is not too high (required on RPi)
-				int status_value = ::ioctl(_serial_fd, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed);
-
-				if (status_value < 0) {
-					PX4_ERR("SPI_IOC_WR_MAX_SPEED_HZ failed for %s (%d)", _port, errno);
-				}
-
-				status_value = ::ioctl(_serial_fd, SPI_IOC_RD_MAX_SPEED_HZ, &spi_speed);
-
-				if (status_value < 0) {
-					PX4_ERR("SPI_IOC_RD_MAX_SPEED_HZ failed for %s (%d)", _port, errno);
-				}
-			}
-
-#endif /* __PX4_LINUX */
+		
+		// open the serial port and check if successful
+		if (!open_serial_fd()) {
+			px4_sleep(1);
+			continue;
 		}
 
 		switch (_mode) {
@@ -1064,30 +1100,32 @@ GPS::run()
 
 				if (!_healthy) {
 					// Helpful for debugging, but too verbose for normal ops
-//						const char *mode_str = "unknown";
-//
-//						switch (_mode) {
-//						case gps_driver_mode_t::UBX:
-//							mode_str = "UBX";
-//							break;
-//
-//						case gps_driver_mode_t::MTK:
-//							mode_str = "MTK";
-//							break;
-//
-//						case gps_driver_mode_t::ASHTECH:
-//							mode_str = "ASHTECH";
-//							break;
-//
-//						case gps_driver_mode_t::EMLIDREACH:
-//							mode_str = "EMLID REACH";
-//							break;
-//
-//						default:
-//							break;
-//						}
-//
-//						PX4_WARN("module found: %s", mode_str);
+					/*
+					const char *mode_str = "unknown";
+
+					switch (_mode) {
+					case gps_driver_mode_t::UBX:
+						mode_str = "UBX";
+						break;
+
+					case gps_driver_mode_t::MTK:
+						mode_str = "MTK";
+						break;
+
+					case gps_driver_mode_t::ASHTECH:
+						mode_str = "ASHTECH";
+						break;
+
+					case gps_driver_mode_t::EMLIDREACH:
+						mode_str = "EMLID REACH";
+						break;
+
+					default:
+						break;
+					}
+
+					PX4_WARN("module found: %s", mode_str);
+					*/
 					_healthy = true;
 				}
 			}
@@ -1148,6 +1186,39 @@ GPS::run()
 	PX4_INFO("exiting");
 }
 
+void 
+GPS::run_forwarding()
+{
+	// No configuration, this is assumed to be handled by the main GPS instance
+	while (!open_serial_fd()) {
+		px4_sleep(1);
+		continue;
+	}
+
+	initializeCommunicationDump();
+
+	uint64_t last_rate_measurement = hrt_absolute_time();
+	unsigned last_rate_count = 0;
+
+	while (!should_exit()) { // Loop and listen for RTCM messages on gpsInjectData uORB topic
+		/* measure update rate every 5 seconds */
+		if (hrt_absolute_time() - last_rate_measurement > RATE_MEASUREMENT_PERIOD) {
+			float dt = (float)((hrt_absolute_time() - last_rate_measurement)) / 1000000.0f;
+			_rate = last_rate_count / dt;
+			_rate_rtcm_injection = _last_rate_rtcm_injection_count / dt;
+			last_rate_measurement = hrt_absolute_time();
+			last_rate_count = 0;
+			_last_rate_rtcm_injection_count = 0;
+		}
+	}
+	if (_serial_fd >= 0) {
+#ifndef __PX4_QURT
+		::close(_serial_fd);
+#endif
+		_serial_fd = -1;
+	}
+}
+
 int
 GPS::print_status()
 {
@@ -1159,6 +1230,11 @@ GPS::print_status()
 	case Instance::Secondary:
 		PX4_INFO("");
 		PX4_INFO("Secondary GPS");
+		break;
+	
+	case Instance::RTCM:
+		PX4_INFO("");
+		PX4_INFO("RTCM Forwarding");
 		break;
 
 	default:
@@ -1216,9 +1292,16 @@ GPS::print_status()
 		print_message(ORB_ID(sensor_gps), _report_gps_pos);
 	}
 
-	if (_instance == Instance::Main && _secondary_instance.load()) {
-		GPS *secondary_instance = _secondary_instance.load();
-		secondary_instance->print_status();
+	GPS *secondary_instance = _secondary_instance.load();
+	GPS *rtcm_instance = _rtcm_instance.load();
+
+	if (_instance == Instance::Main) {
+		if (secondary_instance) {
+			secondary_instance->print_status();
+		}
+		if (rtcm_instance) {
+			rtcm_instance->print_status();
+		}
 	}
 
 	return 0;
@@ -1229,9 +1312,16 @@ GPS::schedule_reset(GPSRestartType restart_type)
 {
 	_scheduled_reset.store((int)restart_type);
 
-	if (_instance == Instance::Main && _secondary_instance.load()) {
-		GPS *secondary_instance = _secondary_instance.load();
-		secondary_instance->schedule_reset(restart_type);
+	GPS *secondary_instance = _secondary_instance.load();
+	GPS *rtcm_instance = _rtcm_instance.load();
+
+	if (_instance == Instance::Main) {
+		if (secondary_instance) {
+			secondary_instance->schedule_reset(restart_type);
+		}
+		if (rtcm_instance)  {
+			rtcm_instance->schedule_reset(restart_type);
+		}
 	}
 }
 
@@ -1419,10 +1509,12 @@ $ gps reset warm
 	PRINT_MODULE_USAGE_PARAM_STRING('d', "/dev/ttyS3", "<file:dev>", "GPS device", true);
 	PRINT_MODULE_USAGE_PARAM_INT('b', 0, 0, 3000000, "Baudrate (can also be p:<param_name>)", true);
 	PRINT_MODULE_USAGE_PARAM_STRING('e', nullptr, "<file:dev>", "Optional secondary GPS device", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('f', nullptr, "<file:dev>", "Optional device for RTCM forwarding", true);
 	PRINT_MODULE_USAGE_PARAM_INT('g', 0, 0, 3000000, "Baudrate (secondary GPS, can also be p:<param_name>)", true);
 
 	PRINT_MODULE_USAGE_PARAM_STRING('i', "uart", "spi|uart", "GPS interface", true);
 	PRINT_MODULE_USAGE_PARAM_STRING('j', "uart", "spi|uart", "secondary GPS interface", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('r', "uart", "spi|uart", "rtcm interface", true);
 	PRINT_MODULE_USAGE_PARAM_STRING('p', nullptr, "ubx|mtk|ash|eml|fem|nmea", "GPS Protocol (default=auto select)", true);
 
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
@@ -1442,8 +1534,10 @@ int GPS::task_spawn(int argc, char *argv[], Instance instance)
 	px4_main_t entry_point;
 	if (instance == Instance::Main) {
 		entry_point = (px4_main_t)&run_trampoline;
-	} else {
+	} else if (instance == Instance::Secondary) {
 		entry_point = (px4_main_t)&run_trampoline_secondary;
+	} else {
+		entry_point = (px4_main_t)&run_trampoline_rtcm;
 	}
 
 	int task_id = px4_task_spawn_cmd("gps", SCHED_DEFAULT,
@@ -1478,6 +1572,24 @@ int GPS::run_trampoline_secondary(int argc, char *argv[])
 	}
 	return 0;
 }
+
+int GPS::run_trampoline_rtcm(int argc, char *argv[])
+{
+	// the task name is the first argument
+	argc -= 1;
+	argv += 1;
+
+	GPS *gps = instantiate(argc, argv, Instance::RTCM);
+	if (gps) {
+		_rtcm_instance.store(gps);
+		gps->run_forwarding();
+
+		_rtcm_instance.store(nullptr);
+		delete gps;
+	}
+	return 0;
+}
+
 GPS *GPS::instantiate(int argc, char *argv[])
 {
 	return instantiate(argc, argv, Instance::Main);
@@ -1490,11 +1602,14 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 #else
 	const char *device_name = nullptr;
 #endif
+	const char *device_name_rtcm = nullptr;
 	const char *device_name_secondary = nullptr;
 	int baudrate_main = 0;
 	int baudrate_secondary = 0;
+	int baudrate_rtcm = 0;
 	GPSHelper::Interface interface = GPSHelper::Interface::UART;
 	GPSHelper::Interface interface_secondary = GPSHelper::Interface::UART;
+	GPSHelper::Interface interface_rtcm = GPSHelper::Interface::UART;
 	gps_driver_mode_t mode = gps_driver_mode_t::None;
 
 	bool error_flag = false;
@@ -1502,7 +1617,7 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 	int ch;
 	const char *myoptarg = nullptr;
 
-	while ((ch = px4_getopt(argc, argv, "b:d:e:g:i:j:p:", &myoptind, &myoptarg)) != EOF) {
+	while ((ch = px4_getopt(argc, argv, "b:d:e:f:g:h:i:j:p:r:", &myoptind, &myoptarg)) != EOF) {
 		switch (ch) {
 		case 'b':
 			if (px4_get_parameter_value(myoptarg, baudrate_main) != 0) {
@@ -1516,6 +1631,12 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 				error_flag = true;
 			}
 			break;
+		case 'h':
+			if (px4_get_parameter_value(myoptarg, baudrate_rtcm) != 0) {
+				PX4_ERR("baudrate parsing failed");
+				error_flag = true;
+			}
+			break;
 
 		case 'd':
 			device_name = myoptarg;
@@ -1523,6 +1644,10 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 
 		case 'e':
 			device_name_secondary = myoptarg;
+			break;
+		
+		case 'f':
+			device_name_rtcm = myoptarg;
 			break;
 
 		case 'i':
@@ -1551,9 +1676,23 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 			}
 			break;
 
+		case 'r':
+			if (!strcmp(myoptarg, "spi")) {
+				interface_rtcm = GPSHelper::Interface::SPI;
+
+			} else if (!strcmp(myoptarg, "uart")) {
+				interface_rtcm = GPSHelper::Interface::UART;
+
+			} else {
+				PX4_ERR("unknown interface for secondary: %s", myoptarg);
+				error_flag = true;
+			}
+			break;
+
 		case 'p':
 			if (!strcmp(myoptarg, "ubx")) {
 				mode = gps_driver_mode_t::UBX;
+
 #ifndef CONSTRAINED_FLASH
 			} else if (!strcmp(myoptarg, "mtk")) {
 				mode = gps_driver_mode_t::MTK;
@@ -1607,27 +1746,45 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 			PX4_ERR("invalid device (-d) %s", device_name ? device_name  : "");
 		}
 
-		if (gps && device_name_secondary) {
-			task_spawn(argc, argv, Instance::Secondary);
-			// wait until running
-			int i = 0;
+		if (gps) {
+			if (device_name_secondary) {
+				task_spawn(argc, argv, Instance::Secondary);
+				wait_for_task_spawn(_secondary_instance);
+			}
+			
+			if (device_name_rtcm) {
+				task_spawn(argc, argv, Instance::RTCM);	
+				wait_for_task_spawn(_rtcm_instance);
+			} else { // create an RTCM interface if UBX mode is set to RoverWithMovingBase
+#ifdef __PX4_QURT
+				param_t handle = param_find("GPS_UBX_MODE");
+				
+				if (handle != PARAM_INVALID) {
+					int32_t gps_ubx_mode = 0;
+					param_get(handle, &gps_ubx_mode);
 
-			do {
-				/* wait up to 1s */
-				px4_usleep(2500);
-
-			} while (!_secondary_instance.load() && ++i < 400);
-
-			if (i == 400) {
-				PX4_ERR("Timed out while waiting for thread to start");
+					if (gps_ubx_mode == 1) { // RoverWithMovingBase
+						const char* rtcm_argv[] = {"-f", "7", "-r", "uart", "-h", "460800"}; // 460800 is ideal UART baud for moving base
+						task_spawn(6, const_cast<char**>(rtcm_argv), Instance::RTCM);	
+						wait_for_task_spawn(_rtcm_instance);
+					}
+				}
+#endif
 			}
 		}
-	} else { // secondary instance
+	} else if (instance == Instance::Secondary) { // secondary instance
 		if (device_name_secondary && (access(device_name_secondary, R_OK|W_OK) == 0)) {
 			gps = new GPS(device_name_secondary, mode, interface_secondary, instance, baudrate_secondary);
 
 		} else {
-			PX4_ERR("invalid secondary device (-g) %s", device_name_secondary ? device_name_secondary : "");
+			PX4_ERR("invalid secondary device (-e) %s", device_name_secondary ? device_name_secondary : "");
+		}
+	} else if (instance == Instance::RTCM) {
+		if (device_name_rtcm && (access(device_name_rtcm, R_OK|W_OK) == 0)) {
+			gps = new GPS(device_name_rtcm, mode, interface_rtcm, instance, baudrate_rtcm);
+
+		} else {
+			PX4_ERR("invalid rtcm device (-f) %s", device_name_rtcm ? device_name_rtcm : "");
 		}
 	}
 
