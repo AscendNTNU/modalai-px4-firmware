@@ -55,6 +55,9 @@ publications:
     - topic: /fmu/out/gps_dump
       type: px4_msgs::msg::GpsDump
 
+    - topic: /fmu/out/gps_inject_data
+      type: px4_msgs::msg::GpsInjectData
+
 subscriptions:
     - topic: /fmu/in/offboard_control_mode
       type: px4_msgs::msg::OffboardControlMode

@@ -68,6 +68,7 @@
 #include <uORB/topics/gps_inject_data.h>
 #include <uORB/topics/sensor_gps.h>
 #include <uORB/topics/sensor_gnss_relative.h>
+#include <uORB/topics/vehicle_command.h>
 
 #ifndef CONSTRAINED_FLASH
 # include "devices/src/ashtech.h"
@@ -197,26 +198,30 @@ private:
 	uint8_t                 _spoofing_state{0};             ///< spoofing state
 	uint8_t                 _jamming_state{0};              ///< jamming state
 
-	uORB::PublicationMulti<sensor_gps_s>	_report_gps_pos_pub{ORB_ID(sensor_gps)};	///< uORB pub for gps position
+	uORB::PublicationMulti<sensor_gps_s>	       _report_gps_pos_pub{ORB_ID(sensor_gps)};	///< uORB pub for gps position
 	uORB::PublicationMulti<sensor_gnss_relative_s> _sensor_gnss_relative_pub{ORB_ID(sensor_gnss_relative)};
-	uORB::PublicationMulti<satellite_info_s>	_report_sat_info_pub{ORB_ID(satellite_info)};		///< uORB pub for satellite info
+	uORB::PublicationMulti<satellite_info_s>	   _report_sat_info_pub{ORB_ID(satellite_info)};		///< uORB pub for satellite info
 
-	float				_rate{0.0f};					///< position update rate
-	float				_rate_rtcm_injection{0.0f};			///< RTCM message injection rate
+	float				_rate{0.0f};					        ///< position update rate
+	float				_rate_rtcm_injection{0.0f};			    ///< RTCM message injection rate
 	unsigned			_last_rate_rtcm_injection_count{0};		///< counter for number of RTCM messages
-	unsigned			_num_bytes_read{0}; 				///< counter for number of read bytes from the UART (within update interval)
-	unsigned			_rate_reading{0}; 				///< reading rate in B/s
+	unsigned			_num_bytes_read{0}; 				    ///< counter for number of read bytes from the UART (within update interval)
+	unsigned			_rate_reading{0}; 				        ///< reading rate in B/s
 	hrt_abstime			_last_rtcm_injection_time{0};			///< time of last rtcm injection
-	uint8_t				_selected_rtcm_instance{0};			///< uorb instance that is being used for RTCM corrections
+	uint8_t				_selected_rtcm_instance{0};			    ///< uorb instance that is being used for RTCM corrections
 
 	const Instance 		_instance;
 
-	uORB::Subscription		     _orb_inject_data_sub{ORB_ID(gps_inject_data)};
+	uORB::Subscription		             _orb_inject_data_sub{ORB_ID(gps_inject_data)};
 	uORB::Publication<gps_inject_data_s> _gps_inject_data_pub{ORB_ID(gps_inject_data)};
 	uORB::Publication<gps_dump_s>	     _dump_communication_pub{ORB_ID(gps_dump)};
-	gps_dump_s			     *_dump_to_device{nullptr};
-	gps_dump_s			     *_dump_from_device{nullptr};
+	gps_dump_s			                 *_dump_to_device{nullptr};
+	gps_dump_s			                 *_dump_from_device{nullptr};
 	gps_dump_comm_mode_t                 _dump_communication_mode{gps_dump_comm_mode_t::Disabled};
+
+	uORB::Subscription                   _orb_vehicle_command_sub{ORB_ID(vehicle_command)};   ///< listen for vehicle command to see if we should change to flying base
+	px4::atomic<int*>                    _new_ubx_mode{0};
+	px4::atomic_bool                     _should_change_ubx_mode{false};
 
 	static px4::atomic_bool _is_gps_main_advertised; ///< for the second gps we want to make sure that it gets instance 1
 	/// and thus we wait until the first one publishes at least one message.
@@ -271,6 +276,22 @@ private:
 	 * @param len
 	 */
 	inline bool injectData(uint8_t *data, size_t len);
+
+	/** 
+	 * check for messages on the vehicle command topic & handle them 
+	 * used to reconfigure to a flying base on external command.
+	 */
+	void handleVehicleCommandTopic();
+	
+	/**
+	 * request a change to a new ubx mode
+	 */
+	void request_ubx_mode_change(GPSDriverUBX::UBXMode new_mode);
+	
+	/**
+	 * used to check if a ubx mode change has been requested 
+	 */
+	bool should_change_ubx_mode() const;
 
 	/**
 	 * set the Baudrate
@@ -483,6 +504,7 @@ int GPS::callback(GPSCallbackType type, void *data1, int data2, void *user)
 int GPS::pollOrRead(uint8_t *buf, size_t buf_length, int timeout)
 {
 	handleInjectDataTopic();
+	handleVehicleCommandTopic();
 
 #if !defined(__PX4_QURT)
 
@@ -631,6 +653,32 @@ bool GPS::injectData(uint8_t *data, size_t len)
 #endif
 
 	return written == len;
+}
+
+void GPS::handleVehicleCommandTopic() 
+{
+	vehicle_command_s msg;
+	if (_orb_vehicle_command_sub.updated()) {
+
+		if (_orb_vehicle_command_sub.copy(&msg)) {
+
+			if (msg.command == 42000) { // Command id for changing to flying base
+				request_ubx_mode_change(GPSDriverUBX::UBXMode::FlyingBase);
+			}
+		}
+	}
+}
+
+void GPS::request_ubx_mode_change(GPSDriverUBX::UBXMode new_mode) 
+{
+	_should_change_ubx_mode.store(true);
+	int int_conversion = static_cast<int>(new_mode);
+	_new_ubx_mode.store(&int_conversion);
+}
+
+bool GPS::should_change_ubx_mode() const 
+{
+	return _should_change_ubx_mode.load();
 }
 
 int GPS::setBaudrate(unsigned baud)
@@ -871,39 +919,45 @@ GPS::run()
 		param_get(handle, &gps_ubx_dynmodel);
 	}
 
-	handle = param_find("GPS_UBX_MODE");
-
 	GPSDriverUBX::UBXMode ubx_mode{GPSDriverUBX::UBXMode::Normal};
 
-	if (handle != PARAM_INVALID) {
-		int32_t gps_ubx_mode = 0;
-		param_get(handle, &gps_ubx_mode);
+	if (should_change_ubx_mode()) {
+		ubx_mode = static_cast<GPSDriverUBX::UBXMode>(*_new_ubx_mode.load());
+		_should_change_ubx_mode.store(false);
+		int* normal = new int{0};
+		_new_ubx_mode.store(normal);
+	} else {
+		handle = param_find("GPS_UBX_MODE");
+		if (handle != PARAM_INVALID) {
+			int32_t gps_ubx_mode = 0;
+			param_get(handle, &gps_ubx_mode);
 
-		if (gps_ubx_mode == 1) { // heading
-			if (_instance == Instance::Main) {
-				ubx_mode = GPSDriverUBX::UBXMode::RoverWithMovingBase;
+			if (gps_ubx_mode == 1) { // heading
+				if (_instance == Instance::Main) {
+					ubx_mode = GPSDriverUBX::UBXMode::RoverWithMovingBase;
 
-			} else {
+				} else {
+					ubx_mode = GPSDriverUBX::UBXMode::MovingBase;
+				}
+
+			} else if (gps_ubx_mode == 2) {
 				ubx_mode = GPSDriverUBX::UBXMode::MovingBase;
-			}
 
-		} else if (gps_ubx_mode == 2) {
-			ubx_mode = GPSDriverUBX::UBXMode::MovingBase;
+			} else if (gps_ubx_mode == 3) {
+				if (_instance == Instance::Main) {
+					ubx_mode = GPSDriverUBX::UBXMode::RoverWithMovingBaseUART1;
 
-		} else if (gps_ubx_mode == 3) {
-			if (_instance == Instance::Main) {
-				ubx_mode = GPSDriverUBX::UBXMode::RoverWithMovingBaseUART1;
+				} else {
+					ubx_mode = GPSDriverUBX::UBXMode::MovingBaseUART1;
+				}
 
-			} else {
+			} else if (gps_ubx_mode == 4) {
 				ubx_mode = GPSDriverUBX::UBXMode::MovingBaseUART1;
+
+			} else if (gps_ubx_mode == 5) { // rover with static base on Uart2
+				ubx_mode = GPSDriverUBX::UBXMode::RoverWithStaticBaseUart2;
+
 			}
-
-		} else if (gps_ubx_mode == 4) {
-			ubx_mode = GPSDriverUBX::UBXMode::MovingBaseUART1;
-
-		} else if (gps_ubx_mode == 5) { // rover with static base on Uart2
-			ubx_mode = GPSDriverUBX::UBXMode::RoverWithStaticBaseUart2;
-
 		}
 	}
 
@@ -1070,7 +1124,8 @@ GPS::run()
 				receive_timeout = TIMEOUT_1HZ;
 			}
 
-			while ((helper_ret = _helper->receive(receive_timeout)) > 0 && !should_exit()) {
+			while ((helper_ret = _helper->receive(receive_timeout)) > 0 && !should_exit()
+					&& !should_change_ubx_mode()) {
 
 				if (helper_ret & 1) {
 					publish();
